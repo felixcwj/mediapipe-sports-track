@@ -236,6 +236,11 @@ def main():
             w = min(w, width - x)
             h = min(h, height - y)
             
+            # Filter out very small detections (likely partial detections of legs, etc.)
+            box_area = w * h
+            if box_area < 2000:  # Minimum area threshold
+                continue
+            
             bottom_center_x = x + w // 2
             bottom_center_y = y + h
             
@@ -258,8 +263,15 @@ def main():
                 green_pixel_count = np.sum(feet_region > 0)
                 total_pixels = feet_region.size
                 
-                # If > 10% of pixels around feet are green, consider it a player on field
-                if total_pixels > 0 and (green_pixel_count / total_pixels) > 0.1:
+                # Calculate green ratio from is_game_scene result
+                green_ratio = np.sum(green_mask > 0) / (height * width)
+                
+                # Adaptive threshold: if scene has lots of green (>0.5), be more lenient
+                # This helps catch running players whose feet might be off ground
+                green_threshold = 0.05 if green_ratio > 0.5 else 0.1
+                
+                # If > threshold of pixels around feet are green, consider it a player on field
+                if total_pixels > 0 and (green_pixel_count / total_pixels) > green_threshold:
                     current_detections.append({
                         'box': (x, y, w, h),
                         'center': (bottom_center_x, bottom_center_y),
