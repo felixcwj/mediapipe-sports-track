@@ -121,7 +121,7 @@ def main():
     options = ObjectDetectorOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         max_results=30,  # Increased to handle more detections
-        score_threshold=0.15,  # Lowered to 0.15 to detect all 18 people (players + referee)
+        score_threshold=0.20,  # Increased to reduce false positives (flags, logos)
         running_mode=VisionRunningMode.VIDEO,
         category_allowlist=['person']
     )
@@ -238,7 +238,12 @@ def main():
             
             # Filter out very small detections (likely partial detections of legs, etc.)
             box_area = w * h
-            if box_area < 2000:  # Minimum area threshold
+            if box_area < 3000:  # Minimum area threshold (increased from 2000)
+                continue
+            
+            # Filter by aspect ratio - people are taller than wide
+            aspect_ratio = h / w if w > 0 else 0
+            if aspect_ratio < 1.2:  # People should be at least 1.2x taller than wide
                 continue
             
             bottom_center_x = x + w // 2
@@ -314,6 +319,17 @@ def main():
         # Draw tracked detections
         for det in current_detections:
             x, y, w, h = det['smoothed_box']
+            
+            # Expand box slightly to better cover player (10% expansion)
+            expand_ratio = 0.10
+            x_expand = int(w * expand_ratio / 2)
+            y_expand = int(h * expand_ratio / 2)
+            
+            x_draw = max(0, x - x_expand)
+            y_draw = max(0, y - y_expand)
+            w_draw = min(w + 2 * x_expand, width - x_draw)
+            h_draw = min(h + 2 * y_expand, height - y_draw)
+            
             bottom_center_x, bottom_center_y = det['center']
             
             # Check if person is wearing yellow (referee)
@@ -334,15 +350,15 @@ def main():
                     is_referee = True
             
             if is_referee:
-                # Draw Orange Box for referee
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+                # Draw Orange Box for referee (using expanded box)
+                cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 165, 255), 2)
                 cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
-                cv2.putText(frame, "REF", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                cv2.putText(frame, "REF", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
             else:
-                # Draw Green Box for player with track ID
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # Draw Green Box for player with track ID (using expanded box)
+                cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 255, 0), 2)
                 cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
-                # cv2.putText(frame, f"#{det['track_id']}", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # cv2.putText(frame, f"#{det['track_id']}", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         prev_boxes = new_prev_boxes
         
