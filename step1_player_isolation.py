@@ -20,6 +20,50 @@ def download_model(url, path):
     else:
         print("Model already exists.")
 
+def analyze_background(frame):
+    """
+    Analyzes the background to detect if it's a player close-up shot.
+    Player close-ups typically have:
+    - Blurred background (low edge density in background)
+    - Uniform/simple background colors (low color variance)
+    
+    Returns: (is_closeup, background_score)
+    """
+    # Convert to grayscale for edge detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Calculate edge density using Laplacian variance (measure of blur)
+    laplacian_var = cv2.Laplacian(blurred, cv2.CV_64F).var()
+    
+    # Calculate color variance in HSV space
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h_var = np.var(hsv[:, :, 0])
+    s_var = np.var(hsv[:, :, 1])
+    
+    # Close-up shots tend to have:
+    # - Lower edge variance (blurred background)
+    # - Moderate color variance (not too chaotic like crowd)
+    
+    # Thresholds (tuned empirically based on test data)
+    # Frame 810 (27s close-up): Lap=20.53, H=3597.96
+    is_blurred = laplacian_var < 100  # Lower = more blurred (very strict for close-ups)
+    is_simple_background = h_var < 5000  # Adjusted for player close-ups with varied colors
+    
+    # Score for debugging
+    background_score = {
+        'laplacian_var': laplacian_var,
+        'h_var': h_var,
+        's_var': s_var
+    }
+    
+    # If background is blurred and relatively simple, likely a close-up
+    is_closeup = is_blurred and is_simple_background
+    
+    return is_closeup, background_score
+
 def is_game_scene(frame, green_threshold=0.3):
     """
     Determines if the frame is a game scene based on the ratio of green pixels.
@@ -78,23 +122,56 @@ def main():
         # Scene Classification
         is_game, green_mask = is_game_scene(frame)
         
-        if not is_game:
-            # Label as Non-Play and skip detailed detection
-            cv2.putText(frame, "Non-Play / Crowd", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            out.write(frame)
-            print(f"Frame {frame_index}: Non-Play")
-            continue
-
-        # Convert to RGB for MediaPipe
+        # Convert to RGB for MediaPipe (needed for both cases)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
         # Detect Objects
-        # Note: detect_for_video requires timestamp in ms
         timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
         detection_result = detector.detect_for_video(mp_image, timestamp_ms)
         
-        # Filter and Draw
+        # If no green field detected, check if it's a close-up shot
+        if not is_game:
+            is_closeup, bg_score = analyze_background(frame)
+            has_person = len(detection_result.detections) > 0
+            
+            # If it's a close-up with a person detected, treat as player close-up
+            if is_closeup and has_person:
+                # Draw all detected people as players (assuming close-up is of players)
+                for detection in detection_result.detections:
+                    bbox = detection.bounding_box
+                    x = int(bbox.origin_x)
+                    y = int(bbox.origin_y)
+                    w = int(bbox.width)
+                    h = int(bbox.height)
+                    
+                    # Clamp coordinates
+                    x = max(0, x)
+                    y = max(0, y)
+                    w = min(w, width - x)
+                    h = min(h, height - y)
+                    
+                    bottom_center_x = x + w // 2
+                    bottom_center_y = y + h
+                    
+                    # Draw as player (yellow box for close-up)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                    cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 255), -1)
+                
+                cv2.putText(frame, "Player Close-up", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                out.write(frame)
+                if frame_index % 30 == 0:
+                    print(f"Frame {frame_index}: Close-up (Lap: {bg_score['laplacian_var']:.1f}, H: {bg_score['h_var']:.1f})")
+                continue
+            else:
+                # Label as Non-Play and skip detailed detection
+                cv2.putText(frame, "Non-Play / Crowd", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                out.write(frame)
+                if frame_index % 30 == 0:
+                    print(f"Frame {frame_index}: Non-Play")
+                continue
+
+        # Game scene with green field - apply green mask filtering
         for detection in detection_result.detections:
             bbox = detection.bounding_box
             
