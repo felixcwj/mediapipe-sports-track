@@ -68,6 +68,7 @@ def analyze_background(frame):
 def is_game_scene(frame, green_threshold=0.3):
     """
     Determines if the frame is a game scene based on the ratio of green pixels.
+    Returns: (is_game, green_mask, field_hull)
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     
@@ -78,7 +79,24 @@ def is_game_scene(frame, green_threshold=0.3):
     mask = cv2.inRange(hsv, lower_green, upper_green)
     green_ratio = np.sum(mask > 0) / (frame.shape[0] * frame.shape[1])
     
-    return green_ratio > green_threshold, mask
+    # Find field hull
+    field_hull = None
+    if green_ratio > 0.1:  # Only if there is some green
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            # Simplify and get convex hull
+            epsilon = 0.01 * cv2.arcLength(largest_contour, True)
+            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+            field_hull = cv2.convexHull(approx)
+            
+            # Create a filled mask for the hull
+            hull_mask = np.zeros_like(mask)
+            cv2.drawContours(hull_mask, [field_hull], -1, 255, -1)
+            # Use the hull mask as the effective field mask
+            mask = hull_mask
+    
+    return green_ratio > green_threshold, mask, field_hull
 
 def calculate_iou(box1, box2):
     """Calculate Intersection over Union between two boxes"""
@@ -154,7 +172,7 @@ def main():
         frame_index += 1
         
         # Scene Classification
-        is_game, green_mask = is_game_scene(frame)
+        is_game, green_mask, field_hull = is_game_scene(frame)
         
         # Convert to RGB for MediaPipe (needed for both cases)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -164,67 +182,11 @@ def main():
         timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
         detection_result = detector.detect_for_video(mp_image, timestamp_ms)
         
-        # If no green field detected, check if it's a close-up shot
-        if not is_game:
-            is_closeup, bg_score = analyze_background(frame)
-            has_person = len(detection_result.detections) > 0
-            person_count = len(detection_result.detections)
-            
-            # Player close-ups: 1-3 people, blurred background, moderate color variance
-            # Crowd scenes: many people OR very uniform background (low H variance)
-            # Frame 360 (12s crowd): H=1308, Frame 390 (13s player): H=3425
-            is_player_closeup = (
-                is_closeup and 
-                has_person and 
-                person_count <= 3 and  # Close-ups usually show 1-3 players
-                bg_score['h_var'] > 1500  # Exclude very uniform scenes (crowd with similar clothing)
-            )
-            
-            # If it's a player close-up, draw detected people
-            if is_player_closeup:
-                # Draw all detected people as players (assuming close-up is of players)
-                for detection in detection_result.detections:
-                    bbox = detection.bounding_box
-                    x = int(bbox.origin_x)
-                    y = int(bbox.origin_y)
-                    w = int(bbox.width)
-                    h = int(bbox.height)
-                    
-                    # Clamp coordinates
-                    x = max(0, x)
-                    y = max(0, y)
-                    w = min(w, width - x)
-                    h = min(h, height - y)
-                    
-                    bottom_center_x = x + w // 2
-                    bottom_center_y = y + h
-                    
-                    # Draw as player (yellow box for close-up)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                    cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 255), -1)
-                
-                cv2.putText(frame, "Player Close-up", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                out.write(frame)
-                if frame_index % 30 == 0:
-                    print(f"Frame {frame_index}: Close-up (Lap: {bg_score['laplacian_var']:.1f}, H: {bg_score['h_var']:.1f})")
-                continue
-            else:
-                # Label as Non-Play and skip detailed detection
-                cv2.putText(frame, "Non-Play / Crowd", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                out.write(frame)
-                if frame_index % 30 == 0:
-                    print(f"Frame {frame_index}: Non-Play")
-                continue
-
-        # Game scene with green field - apply filtering and tracking
-        ad_zone_threshold = int(height * 0.89)  # ~960 for 1080p
-        
         current_detections = []
         
+        # Process detections
         for detection in detection_result.detections:
             bbox = detection.bounding_box
-            
-            # ROI Check: Check if bottom center of bbox is in green area
             x = int(bbox.origin_x)
             y = int(bbox.origin_y)
             w = int(bbox.width)
@@ -236,52 +198,57 @@ def main():
             w = min(w, width - x)
             h = min(h, height - y)
             
-            # Filter out very small detections (likely partial detections of legs, etc.)
+            # Filter out very small detections
             box_area = w * h
-            if box_area < 3000:  # Minimum area threshold (increased from 2000)
+            if box_area < 3000:
                 continue
             
-            # Filter by aspect ratio - people are taller than wide
+            # Filter by aspect ratio
             aspect_ratio = h / w if w > 0 else 0
-            if aspect_ratio < 1.2:  # People should be at least 1.2x taller than wide
+            if aspect_ratio < 1.2:
                 continue
             
             bottom_center_x = x + w // 2
             bottom_center_y = y + h
             
-            # Filter out ad zone - SKIP COMPLETELY, don't even draw red box
-            if bottom_center_y >= ad_zone_threshold:
-                continue
+            # Check if it's a close-up based on size
+            height_ratio = h / height
+            is_large_closeup = height_ratio > 0.35  # If person takes >35% of screen height
             
-            # Check a small window around the feet for green
-            check_radius = 5
-            y_check = min(bottom_center_y, height - 1)
-            x_check = min(max(bottom_center_x, 0), width - 1)
+            is_valid_player = False
             
-            roi_y1 = max(0, y_check - check_radius)
-            roi_y2 = min(height, y_check + check_radius)
-            roi_x1 = max(0, x_check - check_radius)
-            roi_x2 = min(width, x_check + check_radius)
-            
-            if roi_y2 > roi_y1 and roi_x2 > roi_x1:
-                feet_region = green_mask[roi_y1:roi_y2, roi_x1:roi_x2]
-                green_pixel_count = np.sum(feet_region > 0)
-                total_pixels = feet_region.size
-                
-                # Calculate green ratio from is_game_scene result
-                green_ratio = np.sum(green_mask > 0) / (height * width)
-                
-                # Adaptive threshold: if scene has lots of green (>0.5), be more lenient
-                # This helps catch running players whose feet might be off ground
-                green_threshold = 0.05 if green_ratio > 0.5 else 0.1
-                
-                # If > threshold of pixels around feet are green, consider it a player on field
-                if total_pixels > 0 and (green_pixel_count / total_pixels) > green_threshold:
-                    current_detections.append({
-                        'box': (x, y, w, h),
-                        'center': (bottom_center_x, bottom_center_y),
-                        'is_valid': True
-                    })
+            if is_large_closeup:
+                # Large players are valid regardless of field position (close-ups)
+                is_valid_player = True
+            elif is_game and field_hull is not None:
+                # Check if bottom center is inside field hull
+                # measureDist=False returns +1 if inside, -1 if outside, 0 on edge
+                dist = cv2.pointPolygonTest(field_hull, (bottom_center_x, bottom_center_y), False)
+                if dist >= 0:
+                    is_valid_player = True
+            elif not is_game:
+                # Non-game scene (crowd/close-up without green)
+                # Use background analysis
+                is_closeup, bg_score = analyze_background(frame)
+                person_count = len(detection_result.detections)
+                if is_closeup and person_count <= 3 and bg_score['h_var'] > 1500:
+                    is_valid_player = True
+
+            if is_valid_player:
+                current_detections.append({
+                    'box': (x, y, w, h),
+                    'center': (bottom_center_x, bottom_center_y),
+                    'is_valid': True,
+                    'is_closeup': is_large_closeup
+                })
+        
+        # If no valid players found and not game scene, mark as Non-Play
+        if not current_detections and not is_game:
+             cv2.putText(frame, "Non-Play / Crowd", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+             out.write(frame)
+             if frame_index % 30 == 0:
+                 print(f"Frame {frame_index}: Non-Play")
+             continue
         
         # Simple tracking: match current detections with previous boxes
         new_prev_boxes = {}
@@ -332,33 +299,39 @@ def main():
             
             bottom_center_x, bottom_center_y = det['center']
             
-            # Check if person is wearing yellow (referee)
-            person_roi = frame[y:y+h, x:x+w]
-            is_referee = False
-            
-            if person_roi.size > 0:
-                person_hsv = cv2.cvtColor(person_roi, cv2.COLOR_BGR2HSV)
-                
-                # Yellow range for referee uniform
-                lower_yellow = np.array([20, 100, 100])
-                upper_yellow = np.array([30, 255, 255])
-                yellow_mask = cv2.inRange(person_hsv, lower_yellow, upper_yellow)
-                
-                yellow_ratio = np.sum(yellow_mask > 0) / yellow_mask.size
-                
-                if yellow_ratio > 0.15:  # If >15% of person is yellow, likely referee
-                    is_referee = True
-            
-            if is_referee:
-                # Draw Orange Box for referee (using expanded box)
-                cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 165, 255), 2)
-                cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
-                cv2.putText(frame, "REF", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            if det.get('is_closeup', False):
+                # Draw Yellow Box for close-up player
+                cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 255, 255), 2)
+                cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 255), -1)
+                # cv2.putText(frame, "Close-up", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
             else:
-                # Draw Green Box for player with track ID (using expanded box)
-                cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 255, 0), 2)
-                cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
-                # cv2.putText(frame, f"#{det['track_id']}", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Check if person is wearing yellow (referee)
+                person_roi = frame[y:y+h, x:x+w]
+                is_referee = False
+                
+                if person_roi.size > 0:
+                    person_hsv = cv2.cvtColor(person_roi, cv2.COLOR_BGR2HSV)
+                    
+                    # Yellow range for referee uniform
+                    lower_yellow = np.array([20, 100, 100])
+                    upper_yellow = np.array([30, 255, 255])
+                    yellow_mask = cv2.inRange(person_hsv, lower_yellow, upper_yellow)
+                    
+                    yellow_ratio = np.sum(yellow_mask > 0) / yellow_mask.size
+                    
+                    if yellow_ratio > 0.15:  # If >15% of person is yellow, likely referee
+                        is_referee = True
+                
+                if is_referee:
+                    # Draw Orange Box for referee (using expanded box)
+                    cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 165, 255), 2)
+                    cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
+                    cv2.putText(frame, "REF", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                else:
+                    # Draw Green Box for player with track ID (using expanded box)
+                    cv2.rectangle(frame, (x_draw, y_draw), (x_draw + w_draw, y_draw + h_draw), (0, 255, 0), 2)
+                    cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
+                    # cv2.putText(frame, f"#{det['track_id']}", (x_draw, y_draw-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         prev_boxes = new_prev_boxes
         
