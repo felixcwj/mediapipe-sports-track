@@ -134,9 +134,20 @@ def main():
         if not is_game:
             is_closeup, bg_score = analyze_background(frame)
             has_person = len(detection_result.detections) > 0
+            person_count = len(detection_result.detections)
             
-            # If it's a close-up with a person detected, treat as player close-up
-            if is_closeup and has_person:
+            # Player close-ups: 1-3 people, blurred background, moderate color variance
+            # Crowd scenes: many people OR very uniform background (low H variance)
+            # Frame 360 (12s crowd): H=1308, Frame 390 (13s player): H=3425
+            is_player_closeup = (
+                is_closeup and 
+                has_person and 
+                person_count <= 3 and  # Close-ups usually show 1-3 players
+                bg_score['h_var'] > 1500  # Exclude very uniform scenes (crowd with similar clothing)
+            )
+            
+            # If it's a player close-up, draw detected people
+            if is_player_closeup:
                 # Draw all detected people as players (assuming close-up is of players)
                 for detection in detection_result.detections:
                     bbox = detection.bounding_box
