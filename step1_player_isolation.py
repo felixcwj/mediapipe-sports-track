@@ -201,6 +201,13 @@ def main():
             bottom_center_x = x + w // 2
             bottom_center_y = y + h
             
+            # Filter out ad zone (bottom 15% of field, typically y >= 960 for 1080p)
+            # Ad boards are at the edge of the field
+            ad_zone_threshold = int(height * 0.89)  # ~960 for 1080p
+            if bottom_center_y >= ad_zone_threshold:
+                # Person is in ad zone, skip
+                continue
+            
             # Check a small window around the feet for green
             check_radius = 5
             y_check = min(bottom_center_y, height - 1)
@@ -220,9 +227,27 @@ def main():
                 
                 # If > 10% of pixels around feet are green, consider it a player on field
                 if total_pixels > 0 and (green_pixel_count / total_pixels) > 0.1:
-                    # Draw Bounding Box
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
+                    # Check if person is wearing yellow (referee)
+                    person_roi = frame[y:y+h, x:x+w]
+                    if person_roi.size > 0:
+                        person_hsv = cv2.cvtColor(person_roi, cv2.COLOR_BGR2HSV)
+                        
+                        # Yellow range for referee uniform
+                        lower_yellow = np.array([20, 100, 100])
+                        upper_yellow = np.array([30, 255, 255])
+                        yellow_mask = cv2.inRange(person_hsv, lower_yellow, upper_yellow)
+                        
+                        yellow_ratio = np.sum(yellow_mask > 0) / yellow_mask.size
+                        
+                        if yellow_ratio > 0.15:  # If >15% of person is yellow, likely referee
+                            # Draw Orange Box for referee
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+                            cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
+                            cv2.putText(frame, "REF", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                        else:
+                            # Draw Green Box for player
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
                 else:
                     # Draw Red Box for filtered out person
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 1)
