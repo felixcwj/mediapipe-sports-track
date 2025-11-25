@@ -139,7 +139,7 @@ def main():
     options = ObjectDetectorOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         max_results=30,  # Increased to handle more detections
-        score_threshold=0.20,  # Increased to reduce false positives (flags, logos)
+        score_threshold=0.15,  # Lowered to detect more players
         running_mode=VisionRunningMode.VIDEO,
         category_allowlist=['person']
     )
@@ -174,12 +174,18 @@ def main():
         # Scene Classification
         is_game, green_mask, field_hull = is_game_scene(frame)
         
-        # Analyze global scene characteristics (H Variance)
-        # Low H Variance (< 1400) indicates uniform colors, typical of crowd scenes
-        # High H Variance (> 2000) indicates varied colors, typical of player close-ups
+        # Analyze global scene characteristics (H Variance & Laplacian)
+        # Crowd scenes: Low H Variance (uniform colors) OR Low Laplacian (blurred/low detail)
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h_var = np.var(hsv_frame[:, :, 0])
-        is_crowd_scene = h_var < 1400
+        
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
+        
+        # Enhanced crowd detection logic
+        # 1. Very low color variance (< 1500)
+        # 2. OR (Low color variance < 2000 AND Low detail < 50)
+        is_crowd_scene = (h_var < 1500) or (h_var < 2000 and laplacian_var < 50)
         
         # Convert to RGB for MediaPipe (needed for both cases)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -207,12 +213,12 @@ def main():
             
             # Filter out very small detections
             box_area = w * h
-            if box_area < 3000:
+            if box_area < 2500:  # Adjusted for lower threshold
                 continue
             
-            # Filter by aspect ratio
+            # Filter by aspect ratio - people are taller than wide
             aspect_ratio = h / w if w > 0 else 0
-            if aspect_ratio < 1.2:
+            if aspect_ratio < 1.3:  # Stricter aspect ratio
                 continue
             
             bottom_center_x = x + w // 2
@@ -281,7 +287,7 @@ def main():
                 track_id = best_track_id
                 used_track_ids.add(track_id)
                 # Smooth the box
-                smoothed_box = smooth_box(prev_boxes[track_id], curr_box, alpha=0.7)
+                smoothed_box = smooth_box(prev_boxes[track_id], curr_box, alpha=0.6)
             else:
                 track_id = next_track_id
                 next_track_id += 1
@@ -295,8 +301,8 @@ def main():
         for det in current_detections:
             x, y, w, h = det['smoothed_box']
             
-            # Expand box slightly to better cover player (10% expansion)
-            expand_ratio = 0.10
+            # Expand box slightly to better cover player (15% expansion)
+            expand_ratio = 0.15
             x_expand = int(w * expand_ratio / 2)
             y_expand = int(h * expand_ratio / 2)
             
