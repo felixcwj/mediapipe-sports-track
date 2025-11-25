@@ -90,8 +90,8 @@ def main():
 
     options = ObjectDetectorOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
-        max_results=20,
-        score_threshold=0.3,
+        max_results=30,  # Increased to handle more detections
+        score_threshold=0.15,  # Lowered to 0.15 to detect all 18 people (players + referee)
         running_mode=VisionRunningMode.VIDEO,
         category_allowlist=['person']
     )
