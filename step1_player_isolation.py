@@ -91,8 +91,8 @@ def main():
     options = ObjectDetectorOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         max_results=50,
-        score_threshold=0.10,  # Very low threshold for ByteTrack to recover
-        running_mode=VisionRunningMode.VIDEO,
+        score_threshold=0.20,
+        running_mode=VisionRunningMode.IMAGE, # Changed to IMAGE for tiling
         category_allowlist=['person']
     )
 
@@ -111,6 +111,124 @@ def main():
     
     prev_frame = None
     frame_index = 0
+    
+    def non_max_suppression(boxes, scores, threshold):
+        if len(boxes) == 0:
+            return [], []
+        
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+        
+        # coordinates
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 0] + boxes[:, 2]
+        y2 = boxes[:, 1] + boxes[:, 3]
+        
+        area = (x2 - x1) * (y2 - y1)
+        idxs = np.argsort(scores)
+        
+        pick = []
+        
+        while len(idxs) > 0:
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
+            
+            xx1 = np.maximum(x1[i], x1[idxs[:last]])
+            yy1 = np.maximum(y1[i], y1[idxs[:last]])
+            xx2 = np.minimum(x2[i], x2[idxs[:last]])
+            yy2 = np.minimum(y2[i], y2[idxs[:last]])
+            
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            
+            overlap = (w * h) / area[idxs[:last]]
+            
+            idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > threshold)[0])))
+            
+        return boxes[pick], scores[pick]
+
+    def detect_with_tiling(detector, frame):
+        height, width = frame.shape[:2]
+        
+        # Define tiles (2x2 with overlap)
+        # Overlap size
+        overlap = 100
+        
+        h_half = height // 2
+        w_half = width // 2
+        
+        tiles = [
+            # x, y, w, h (ROI)
+            (0, 0, w_half + overlap, h_half + overlap), # Top-Left
+            (w_half - overlap, 0, w_half + overlap, h_half + overlap), # Top-Right
+            (0, h_half - overlap, w_half + overlap, h_half + overlap), # Bottom-Left
+            (w_half - overlap, h_half - overlap, w_half + overlap, h_half + overlap) # Bottom-Right
+        ]
+        
+        all_boxes = []
+        all_scores = []
+        
+        # 1. Global Detection (Full Frame)
+        # Good for context and large players
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        detection_result = detector.detect(mp_image)
+        
+        for det in detection_result.detections:
+            bbox = det.bounding_box
+            all_boxes.append([bbox.origin_x, bbox.origin_y, bbox.width, bbox.height])
+            all_scores.append(det.categories[0].score)
+            
+        # 2. Tile Detection
+        for tx, ty, tw, th in tiles:
+            # Clamp
+            tx = max(0, tx)
+            ty = max(0, ty)
+            tw = min(tw, width - tx)
+            th = min(th, height - ty)
+            
+            tile = frame[ty:ty+th, tx:tx+tw]
+            rgb_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)
+            mp_tile = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_tile)
+            
+            tile_result = detector.detect(mp_tile)
+            
+            for det in tile_result.detections:
+                bbox = det.bounding_box
+                # Offset coordinates to global
+                gx = bbox.origin_x + tx
+                gy = bbox.origin_y + ty
+                all_boxes.append([gx, gy, bbox.width, bbox.height])
+                all_scores.append(det.categories[0].score)
+                
+        # 3. NMS
+        if not all_boxes:
+            return []
+            
+        nms_boxes, nms_scores = non_max_suppression(all_boxes, all_scores, 0.5)
+        
+        # Reconstruct detection objects (simplified for internal use)
+        final_detections = []
+        for box, score in zip(nms_boxes, nms_scores):
+            # Create a dummy object structure similar to MediaPipe result
+            class DummyCategory:
+                def __init__(self, score): self.score = score
+            class DummyBBox:
+                def __init__(self, x, y, w, h):
+                    self.origin_x = x
+                    self.origin_y = y
+                    self.width = w
+                    self.height = h
+            class DummyDetection:
+                def __init__(self, bbox, score):
+                    self.bounding_box = bbox
+                    self.categories = [DummyCategory(score)]
+            
+            final_detections.append(DummyDetection(DummyBBox(*box), score))
+            
+        return final_detections
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -138,11 +256,14 @@ def main():
         # Close-up = High H Var OR High Motion (camera pan)
         # But we rely mostly on box size for close-ups
         
-        # 2. Detection
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
-        detection_result = detector.detect_for_video(mp_image, timestamp_ms)
+        # 2. Detection with Tiling
+        # Use tiling to detect small players in wide shots
+        detections_list = detect_with_tiling(detector, frame)
+        
+        # Wrap in a dummy result object for compatibility
+        class DummyResult:
+            def __init__(self, dets): self.detections = dets
+        detection_result = DummyResult(detections_list)
         
         dets_high = []
         dets_low = []
