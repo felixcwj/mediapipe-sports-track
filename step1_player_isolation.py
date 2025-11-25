@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import os
 import requests
+from collections import defaultdict
 
 # Constants
 MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -79,6 +80,35 @@ def is_game_scene(frame, green_threshold=0.3):
     
     return green_ratio > green_threshold, mask
 
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two boxes"""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+    
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
+
+def smooth_box(prev_box, curr_box, alpha=0.7):
+    """Smooth box coordinates using exponential moving average"""
+    if prev_box is None:
+        return curr_box
+    
+    x = int(alpha * curr_box[0] + (1 - alpha) * prev_box[0])
+    y = int(alpha * curr_box[1] + (1 - alpha) * prev_box[1])
+    w = int(alpha * curr_box[2] + (1 - alpha) * prev_box[2])
+    h = int(alpha * curr_box[3] + (1 - alpha) * prev_box[3])
+    
+    return (x, y, w, h)
+
 def main():
     download_model(MODEL_URL, MODEL_PATH)
     
@@ -111,6 +141,10 @@ def main():
     out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
 
     frame_index = 0
+    
+    # Tracking state
+    prev_boxes = {}  # {track_id: (x, y, w, h)}
+    next_track_id = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -182,7 +216,11 @@ def main():
                     print(f"Frame {frame_index}: Non-Play")
                 continue
 
-        # Game scene with green field - apply green mask filtering
+        # Game scene with green field - apply filtering and tracking
+        ad_zone_threshold = int(height * 0.89)  # ~960 for 1080p
+        
+        current_detections = []
+        
         for detection in detection_result.detections:
             bbox = detection.bounding_box
             
@@ -201,11 +239,8 @@ def main():
             bottom_center_x = x + w // 2
             bottom_center_y = y + h
             
-            # Filter out ad zone (bottom 15% of field, typically y >= 960 for 1080p)
-            # Ad boards are at the edge of the field
-            ad_zone_threshold = int(height * 0.89)  # ~960 for 1080p
+            # Filter out ad zone - SKIP COMPLETELY, don't even draw red box
             if bottom_center_y >= ad_zone_threshold:
-                # Person is in ad zone, skip
                 continue
             
             # Check a small window around the feet for green
@@ -213,8 +248,6 @@ def main():
             y_check = min(bottom_center_y, height - 1)
             x_check = min(max(bottom_center_x, 0), width - 1)
             
-            # Simple check: is the pixel at feet green?
-            # Or better: check a small region
             roi_y1 = max(0, y_check - check_radius)
             roi_y2 = min(height, y_check + check_radius)
             roi_x1 = max(0, x_check - check_radius)
@@ -227,30 +260,79 @@ def main():
                 
                 # If > 10% of pixels around feet are green, consider it a player on field
                 if total_pixels > 0 and (green_pixel_count / total_pixels) > 0.1:
-                    # Check if person is wearing yellow (referee)
-                    person_roi = frame[y:y+h, x:x+w]
-                    if person_roi.size > 0:
-                        person_hsv = cv2.cvtColor(person_roi, cv2.COLOR_BGR2HSV)
-                        
-                        # Yellow range for referee uniform
-                        lower_yellow = np.array([20, 100, 100])
-                        upper_yellow = np.array([30, 255, 255])
-                        yellow_mask = cv2.inRange(person_hsv, lower_yellow, upper_yellow)
-                        
-                        yellow_ratio = np.sum(yellow_mask > 0) / yellow_mask.size
-                        
-                        if yellow_ratio > 0.15:  # If >15% of person is yellow, likely referee
-                            # Draw Orange Box for referee
-                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
-                            cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
-                            cv2.putText(frame, "REF", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
-                        else:
-                            # Draw Green Box for player
-                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                            cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
-                else:
-                    # Draw Red Box for filtered out person
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 1)
+                    current_detections.append({
+                        'box': (x, y, w, h),
+                        'center': (bottom_center_x, bottom_center_y),
+                        'is_valid': True
+                    })
+        
+        # Simple tracking: match current detections with previous boxes
+        new_prev_boxes = {}
+        used_track_ids = set()
+        
+        for det in current_detections:
+            curr_box = det['box']
+            best_iou = 0
+            best_track_id = None
+            
+            # Find best matching previous box
+            for track_id, prev_box in prev_boxes.items():
+                if track_id in used_track_ids:
+                    continue
+                iou = calculate_iou(prev_box, curr_box)
+                if iou > best_iou and iou > 0.3:  # Threshold for matching
+                    best_iou = iou
+                    best_track_id = track_id
+            
+            # Assign track ID
+            if best_track_id is not None:
+                track_id = best_track_id
+                used_track_ids.add(track_id)
+                # Smooth the box
+                smoothed_box = smooth_box(prev_boxes[track_id], curr_box, alpha=0.7)
+            else:
+                track_id = next_track_id
+                next_track_id += 1
+                smoothed_box = curr_box
+            
+            new_prev_boxes[track_id] = smoothed_box
+            det['track_id'] = track_id
+            det['smoothed_box'] = smoothed_box
+        
+        # Draw tracked detections
+        for det in current_detections:
+            x, y, w, h = det['smoothed_box']
+            bottom_center_x, bottom_center_y = det['center']
+            
+            # Check if person is wearing yellow (referee)
+            person_roi = frame[y:y+h, x:x+w]
+            is_referee = False
+            
+            if person_roi.size > 0:
+                person_hsv = cv2.cvtColor(person_roi, cv2.COLOR_BGR2HSV)
+                
+                # Yellow range for referee uniform
+                lower_yellow = np.array([20, 100, 100])
+                upper_yellow = np.array([30, 255, 255])
+                yellow_mask = cv2.inRange(person_hsv, lower_yellow, upper_yellow)
+                
+                yellow_ratio = np.sum(yellow_mask > 0) / yellow_mask.size
+                
+                if yellow_ratio > 0.15:  # If >15% of person is yellow, likely referee
+                    is_referee = True
+            
+            if is_referee:
+                # Draw Orange Box for referee
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+                cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 165, 255), -1)
+                cv2.putText(frame, "REF", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            else:
+                # Draw Green Box for player with track ID
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.circle(frame, (bottom_center_x, bottom_center_y), 5, (0, 255, 0), -1)
+                # cv2.putText(frame, f"#{det['track_id']}", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        prev_boxes = new_prev_boxes
         
         out.write(frame)
         if frame_index % 30 == 0:
