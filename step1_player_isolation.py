@@ -129,10 +129,10 @@ def main():
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
         
-        # Crowd Detection (Issue #5, #8)
-        # Crowd = Low H Var AND Low Motion
-        # Adjusted threshold: H Var < 1400 is definitely crowd. Motion < 0.1 is static.
-        is_crowd = (h_var < 1400) and (motion_score < 0.15)
+            # Crowd Detection (Issue #5, #8)
+        # Crowd = Low H Var (uniform) OR Low Laplacian (blurred) AND Low Motion
+        # Added Laplacian check because some crowd scenes might have color variety but are out of focus
+        is_crowd = ((h_var < 1400) or (laplacian_var < 50)) and (motion_score < 0.15)
         
         # Close-up Detection (Issue #6, #7, #9)
         # Close-up = High H Var OR High Motion (camera pan)
@@ -171,8 +171,8 @@ def main():
             is_closeup_box = height_ratio > 0.35
             
             if is_crowd and not is_closeup_box:
-                # In crowd scenes, ignore normal sized people (likely crowd)
-                # Only accept if very high confidence? No, safer to skip.
+                # In crowd scenes, STRICTLY ignore normal sized people
+                # This is the most effective way to remove crowd boxes
                 continue
                 
             if is_closeup_box:
@@ -182,9 +182,9 @@ def main():
                     is_valid = True
             elif is_game and field_hull is not None:
                 # Check if inside field hull (Issue #3)
-                # Strict check: -5 pixels buffer
+                # Strict check: -2 pixels buffer (Stricter than before)
                 dist = cv2.pointPolygonTest(field_hull, bottom_center, True)
-                if dist >= -5: # Allow slight margin error, but mostly inside
+                if dist >= -2: 
                     is_valid = True
             elif not is_game:
                 # Non-game, non-closeup, non-crowd?
@@ -195,11 +195,11 @@ def main():
                 # Add to lists for ByteTrack
                 # Format: [x, y, w, h]
                 det_arr = np.array([x, y, w, h])
-                if score > 0.4:
+                # Lowered High Conf threshold to 0.2 to start tracks for smaller/less clear players
+                if score > 0.2:
                     dets_high.append(det_arr)
                 elif score > 0.1:
                     # In crowd scenes, DO NOT use low confidence detections to recover tracks
-                    # This prevents noise in the crowd from being picked up
                     if not is_crowd:
                         dets_low.append(det_arr)
         
