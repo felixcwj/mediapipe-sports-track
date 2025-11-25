@@ -174,6 +174,13 @@ def main():
         # Scene Classification
         is_game, green_mask, field_hull = is_game_scene(frame)
         
+        # Analyze global scene characteristics (H Variance)
+        # Low H Variance (< 1400) indicates uniform colors, typical of crowd scenes
+        # High H Variance (> 2000) indicates varied colors, typical of player close-ups
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h_var = np.var(hsv_frame[:, :, 0])
+        is_crowd_scene = h_var < 1400
+        
         # Convert to RGB for MediaPipe (needed for both cases)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -213,7 +220,8 @@ def main():
             
             # Check if it's a close-up based on size
             height_ratio = h / height
-            is_large_closeup = height_ratio > 0.35  # If person takes >35% of screen height
+            # Only consider large boxes if it's NOT a crowd scene (low variance)
+            is_large_closeup = (height_ratio > 0.35) and (not is_crowd_scene)
             
             is_valid_player = False
             
