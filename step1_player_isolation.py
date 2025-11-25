@@ -268,7 +268,9 @@ def main():
         dets_high = []
         dets_low = []
         
-        # 3. Filter & Categorize Detections
+        # 3. Triple Check Validation
+        # A detection must pass ALL 3 checks to be accepted.
+        
         for detection in detection_result.detections:
             bbox = detection.bounding_box
             score = detection.categories[0].score
@@ -280,49 +282,68 @@ def main():
             w = min(w, width - x)
             h = min(h, height - y)
             
-            # Basic Filters
-            if w*h < 2000: continue # Min area
-            if h/w < 1.2: continue # Aspect ratio
-            
-            # Scene Context Filtering
             bottom_center = (x + w//2, y + h)
             height_ratio = h / height
-            
-            is_valid = False
             is_closeup_box = height_ratio > 0.35
             
-            if is_crowd and not is_closeup_box:
-                # In crowd scenes, STRICTLY ignore normal sized people
-                # This is the most effective way to remove crowd boxes
-                continue
-                
-            if is_closeup_box:
-                # Large box - check if it's likely a player
-                # If motion is high or H var is decent, accept
-                if motion_score > 0.1 or h_var > 1500:
-                    is_valid = True
-            elif is_game and field_hull is not None:
-                # Check if inside field hull (Issue #3)
-                # Strict check: -2 pixels buffer (Stricter than before)
-                dist = cv2.pointPolygonTest(field_hull, bottom_center, True)
-                if dist >= -2: 
-                    is_valid = True
-            elif not is_game:
-                # Non-game, non-closeup, non-crowd?
-                # Maybe a transition. Be conservative.
-                pass
+            # --- CHECK 1: GEOMETRIC VALIDITY ---
+            # Is it a person-like shape?
+            pass_check_1 = True
+            if w*h < 2000: pass_check_1 = False # Too small
+            if h/w < 1.2: pass_check_1 = False # Not tall enough
+            if score < 0.2: pass_check_1 = False # Low confidence (Global threshold)
             
-            if is_valid:
-                # Add to lists for ByteTrack
-                # Format: [x, y, w, h]
-                det_arr = np.array([x, y, w, h])
-                # Lowered High Conf threshold to 0.2 to start tracks for smaller/less clear players
-                if score > 0.2:
-                    dets_high.append(det_arr)
-                elif score > 0.1:
-                    # In crowd scenes, DO NOT use low confidence detections to recover tracks
-                    if not is_crowd:
-                        dets_low.append(det_arr)
+            if not pass_check_1: continue
+
+            # --- CHECK 2: SCENE CONTEXT VALIDITY ---
+            # Is it appropriate for the current scene (Crowd vs Game)?
+            pass_check_2 = True
+            if is_crowd:
+                # In crowd scenes, we ONLY accept close-up boxes that look very distinct
+                if not is_closeup_box:
+                    pass_check_2 = False
+                else:
+                    # Even if large, must have some motion or color variance to be a player
+                    if motion_score < 0.1 and h_var < 1400:
+                        pass_check_2 = False
+            
+            if not pass_check_2: continue
+
+            # --- CHECK 3: LOCATION / SEMANTIC VALIDITY ---
+            # Is it on the field OR a valid close-up?
+            pass_check_3 = False
+            
+            if is_closeup_box:
+                # For close-ups, we trust the size + Check 2 (Scene)
+                # But we can add an extra check: Center shouldn't be too high up?
+                # For now, if it passed Check 2 in a crowd/game, it's likely good.
+                pass_check_3 = True
+                
+            elif is_game and field_hull is not None:
+                # Must be inside the field hull
+                # Strict check: -2 pixels buffer
+                dist = cv2.pointPolygonTest(field_hull, bottom_center, True)
+                if dist >= -2:
+                    pass_check_3 = True
+            
+            elif not is_game:
+                # Non-game, non-crowd, non-closeup? (Transition)
+                # Be conservative: Reject unless very high score
+                if score > 0.6:
+                    pass_check_3 = True
+
+            if not pass_check_3: continue
+
+            # --- PASSED ALL CHECKS ---
+            det_arr = np.array([x, y, w, h])
+            
+            # Categorize for ByteTrack
+            if score > 0.4:
+                dets_high.append(det_arr)
+            else:
+                # Only use low conf for tracking if NOT crowd (double safety)
+                if not is_crowd:
+                    dets_low.append(det_arr)
         
         # 4. Update Tracker
         tracks = tracker.update(np.array(dets_high) if dets_high else np.empty((0, 4)),
